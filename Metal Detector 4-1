@@ -1,0 +1,96 @@
+/* * Wheat Milling Smart Sensor - Final Integration Script
+ * Target: Arduino MKR WiFi 1010 + DRV5053RAQLPG
+ * Strategy: Adaptive Thresholding with Serial Rate-Limiting
+ */
+
+// --- PIN CONFIGURATION ---
+const int hallPin = A4;      // Hall sensor output (Remember your 10k Pull-up!)
+const int ledPin = 8;        // Indicator LED
+
+// --- SENSITIVITY & FILTERING ---
+// Lower SENSITIVITY = More sensitive (try 5-15)
+const int SENSITIVITY = 30;   
+// FILTER_WEIGHT (0.01 to 0.1) - How fast the baseline "follows" the sensor
+const float FILTER_WEIGHT = 0.02; 
+
+// --- TIMING ---
+const int ALARM_DURATION = 1500;  // LED on-time (ms)
+const int PRINT_INTERVAL = 100;   // Update monitor every 100ms (prevents flooding)
+
+// --- VARIABLES ---
+float baseline = 0;
+unsigned long alarmTimer = 0;
+unsigned long lastPrintTime = 0;
+bool isAlarmActive = false;
+
+void setup() {
+  // Use high baud rate for SAMD21 processors (MKR 1010)
+  Serial.begin(115200); 
+  pinMode(ledPin, OUTPUT);
+  
+  // Set 12-bit resolution (0 - 4095)
+  analogReadResolution(12);
+
+  // Initial Calibration: Build a starting baseline
+  Serial.println(">>> SYSTEM INITIALIZING...");
+  float sum = 0;
+  for(int i = 0; i < 200; i++) {
+    sum += analogRead(hallPin);
+    delay(2);
+  }
+  baseline = sum / 200.0;
+  Serial.println(">>> CALIBRATION COMPLETE. MONITORING STARTED.");
+}
+
+void loop() {
+  // 1. FAST SAMPLING (No delays)
+  int rawValue = analogRead(hallPin);
+
+  // 2. ADAPTIVE BASELINE
+  // The baseline slowly drifts to match the current magnetic environment
+  baseline = (rawValue * FILTER_WEIGHT) + (baseline * (1.0 - FILTER_WEIGHT));
+  
+  // Calculate how far the current reading is from the "normal" baseline
+  float deviation = abs(rawValue - baseline);
+
+  // 3. DETECTION LOGIC
+  // If a sudden spike occurs that exceeds our sensitivity threshold
+  if (deviation > SENSITIVITY && !isAlarmActive) {
+    triggerAlarm(rawValue, deviation);
+  }
+
+  // 4. NON-BLOCKING LED RESET
+  // Checks if the 1.5 seconds are up without stopping the rest of the code
+  if (isAlarmActive && (millis() - alarmTimer >= ALARM_DURATION)) {
+    digitalWrite(ledPin, LOW);
+    isAlarmActive = false;
+  }
+
+  // 5. RATE-LIMITED SERIAL OUTPUT
+  // Only prints data to the monitor/plotter every 100ms
+  if (millis() - lastPrintTime >= PRINT_INTERVAL) {
+    Serial.print("Reading:");     Serial.print(rawValue);
+    Serial.print(",");
+    Serial.print("Baseline:");    Serial.print(baseline);
+    Serial.print(",");
+    Serial.print("Trigger:");     Serial.print(baseline + SENSITIVITY);
+    Serial.print(",");
+    Serial.print("Deviation:");   Serial.println(deviation);
+    lastPrintTime = millis();
+  }
+}
+
+// Function to handle the alarm state
+void triggerAlarm(int val, float dev) {
+  digitalWrite(ledPin, HIGH);
+  alarmTimer = millis();
+  isAlarmActive = true;
+
+  // Print a high-visibility alert that breaks the stream
+  Serial.println("\n------------------------------------");
+  Serial.print("!!! METAL DETECTED !!! | Value: ");
+  Serial.print(val);
+  Serial.print(" | Deviation: ");
+  Serial.println(dev);
+  Serial.println("------------------------------------\n");
+}
