@@ -1,0 +1,33 @@
+// Multiplexer select pins
+int S0 = A4;
+int S1 = A3;
+int S2 = A2;
+int S3 = A1;
+
+// Multiplexer SIG pin connected to Arduino analog pin
+int SIG = A0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+}
+
+void loop() {
+  // Select channel C8
+  digitalWrite(S0, LOW);   // 8 = 1000
+  digitalWrite(S1, LOW);
+  digitalWrite(S2, LOW);
+  digitalWrite(S3, HIGH);
+
+  delay(5); // settle time
+
+  int sensorValue = analogRead(SIG);
+
+  Serial.println(sensorValue);
+
+  delay(200);
+}
