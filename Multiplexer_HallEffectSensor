@@ -1,11 +1,39 @@
-// Multiplexer select pins
-int S0 = A4;
-int S1 = A3;
-int S2 = A2;
-int S3 = A1;
+// -------- MULTIPLEXER PINS --------
+const int S0 = A4;
+const int S1 = A3;
+const int S2 = A2;
+const int S3 = A1;
+const int SIG = A0;     // MUX SIG pin
 
-// Multiplexer SIG pin connected to Arduino analog pin
-int SIG = A0;
+// -------- OUTPUT --------
+const int ledPin = 8;
+
+// -------- SETTINGS --------
+const int CHANNEL = 8;          // Using C8
+const int SENSITIVITY = 30;
+const float FILTER_WEIGHT = 0.02;
+
+const int ALARM_DURATION = 1500;
+const int PRINT_INTERVAL = 100;
+
+// -------- VARIABLES --------
+float baseline = 0;
+unsigned long alarmTimer = 0;
+unsigned long lastPrintTime = 0;
+bool isAlarmActive = false;
+
+void selectChannel(int ch) {
+  digitalWrite(S0, ch & 1);
+  digitalWrite(S1, (ch >> 1) & 1);
+  digitalWrite(S2, (ch >> 2) & 1);
+  digitalWrite(S3, (ch >> 3) & 1);
+}
+
+int readMux(int channel) {
+  selectChannel(channel);
+  delayMicroseconds(300);   // settle time
+  return analogRead(SIG);
+}
 
 void setup() {
   Serial.begin(115200);
@@ -14,20 +42,70 @@ void setup() {
   pinMode(S1, OUTPUT);
   pinMode(S2, OUTPUT);
   pinMode(S3, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+
+  analogReadResolution(12);
+
+  Serial.println(">>> SYSTEM INITIALIZING...");
+
+  float sum = 0;
+  for (int i = 0; i < 200; i++) {
+    sum += readMux(CHANNEL);
+    delay(2);
+  }
+
+  baseline = sum / 200.0;
+
+  Serial.println(">>> CALIBRATION COMPLETE. MONITORING STARTED.");
 }
 
 void loop() {
-  // Select channel C8
-  digitalWrite(S0, LOW);   // 8 = 1000
-  digitalWrite(S1, LOW);
-  digitalWrite(S2, LOW);
-  digitalWrite(S3, HIGH);
+  int rawValue = readMux(CHANNEL);
 
-  delay(5); // settle time
+  baseline = (rawValue * FILTER_WEIGHT) + (baseline * (1.0 - FILTER_WEIGHT));
 
-  int sensorValue = analogRead(SIG);
+  float deviation = abs(rawValue - baseline);
 
-  Serial.println(sensorValue);
+  if (deviation > SENSITIVITY && !isAlarmActive) {
+    triggerAlarm(rawValue, deviation);
+  }
 
-  delay(200);
+  if (isAlarmActive && (millis() - alarmTimer >= ALARM_DURATION)) {
+    digitalWrite(ledPin, LOW);
+    isAlarmActive = false;
+  }
+
+  if (millis() - lastPrintTime >= PRINT_INTERVAL) {
+    Serial.print("Reading:");
+    Serial.print(rawValue);
+    Serial.print(",");
+
+    Serial.print("Baseline:");
+    Serial.print(baseline);
+    Serial.print(",");
+
+    Serial.print("Trigger:");
+    Serial.print(baseline + SENSITIVITY);
+    Serial.print(",");
+
+    Serial.print("Deviation:");
+    Serial.println(deviation);
+
+    lastPrintTime = millis();
+  }
+}
+
+void triggerAlarm(int val, float dev) {
+  digitalWrite(ledPin, HIGH);
+  alarmTimer = millis();
+  isAlarmActive = true;
+
+  Serial.println();
+  Serial.println("------------------------------------");
+  Serial.print("!!! MAGNET DETECTED !!! | Value: ");
+  Serial.print(val);
+  Serial.print(" | Deviation: ");
+  Serial.println(dev);
+  Serial.println("------------------------------------");
+  Serial.println();
 }
