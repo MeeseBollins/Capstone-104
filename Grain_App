@@ -1,0 +1,53 @@
+#include <ArduinoBLE.h>
+
+BLEService ledService("19B10000-E8F2-537E-4F6C-D104768A1214"); // Custom service
+BLEByteCharacteristic switchCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLEWrite);
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+  
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  if (!BLE.begin()) {
+    Serial.println("Starting BLE failed!");
+    while (1);
+  }
+  
+  BLE.setLocalName("MKR WiFi 1010");
+  BLE.setAdvertisedService(ledService);
+  
+  ledService.addCharacteristic(switchCharacteristic);
+  BLE.addService(ledService);
+  
+  switchCharacteristic.writeValue(0);
+  BLE.advertise();
+  
+  Serial.println("BLE LED Peripheral");
+}
+
+void loop() {
+  BLEDevice central = BLE.central();
+  
+  if (central) {
+    Serial.print("Connected to central: ");
+    Serial.println(central.address());
+    digitalWrite(LED_BUILTIN, HIGH);
+    
+    while (central.connected()) {
+      if (switchCharacteristic.written()) {
+        if (switchCharacteristic.value()) {
+          Serial.println("LED ON");
+          digitalWrite(LED_BUILTIN, HIGH);
+        } else {
+          Serial.println("LED OFF");
+          digitalWrite(LED_BUILTIN, LOW);
+        }
+      }
+    }
+    
+    digitalWrite(LED_BUILTIN, LOW);
+    Serial.print("Disconnected from central: ");
+    Serial.println(central.address());
+  }
+}
