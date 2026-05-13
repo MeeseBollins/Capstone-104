@@ -1,6 +1,6 @@
 /*
  * Wheat Milling Metal Detector - Continuous Logging Version
- * Logic: Multiplexer addressing using explicit IF/SWITCH statements.
+ * Logic: Non-stop polling with time-stamped event logging.
  */
 
 // --- Pin Definitions ---
@@ -12,36 +12,15 @@ const int ALARM_PIN  = 13;
 // --- Sensitivity & Timing ---
 const int   NUM_CHANNELS     = 4;
 const float VREF             = 3.3;   
-const float SPIKE_DELTA      = 0.20;  // High sensitivity for 3cm gap
+const float SPIKE_DELTA      = 0.25;  // Adjust based on 3cm magnet distance
 const int   CAL_SAMPLES      = 64;
-const unsigned long ALARM_ON_TIME = 500; 
+const unsigned long ALARM_ON_TIME = 500; // MS the LED stays on after a hit
 
 // --- Runtime State ---
 float baseline[NUM_CHANNELS];
 float threshold[NUM_CHANNELS];
 unsigned long lastAlarmTime = 0;
 unsigned long lastHeartbeat = 0;
-
-// ─── REWRITTEN SELECTION LOGIC ───
-// This function replaces the bitwise math with explicit pin states.
-void selectChannel(int ch) {
-  if (ch == 0) {
-    digitalWrite(S1, LOW);  // Binary 00
-    digitalWrite(S0, LOW);
-  } 
-  else if (ch == 1) {
-    digitalWrite(S1, LOW);  // Binary 01
-    digitalWrite(S0, HIGH);
-  } 
-  else if (ch == 2) {
-    digitalWrite(S1, HIGH); // Binary 10
-    digitalWrite(S0, LOW);
-  } 
-  else if (ch == 3) {
-    digitalWrite(S1, HIGH); // Binary 11
-    digitalWrite(S0, HIGH);
-  }
-}
 
 void setup() {
   pinMode(S0, OUTPUT);
@@ -51,28 +30,35 @@ void setup() {
   Serial.begin(115200);
   while (!Serial); 
 
-  Serial.println("--- INITIALIZING CONTINUOUS MONITORING (IF-LOGIC) ---");
+  Serial.println("--- INITIALIZING CONTINUOUS MONITORING ---");
   calibrate();
 }
 
 void loop() {
+  // 1. Scan all 4 sensors in a continuous loop
   for (int i = 0; i < NUM_CHANNELS; i++) {
-    selectChannel(i);
-    delayMicroseconds(150); // Increased settle time for reliability
+    digitalWrite(S0, i & 0x01);
+    digitalWrite(S1, (i >> 1) & 0x01);
+    delayMicroseconds(100); // Settle time
 
     float volts = (analogRead(SIG_PIN) * VREF) / 1023.0;
 
+    // 2. Detection Logic
     if (volts >= threshold[i]) {
       logDetection(i + 1, volts);
     }
     
+    // 1ms delay per sensor as per requirement
     delay(1); 
   }
 
+  // 3. Manage Alarm Pin (Non-blocking)
+  // Keeps the LED/Alarm visible for 500ms after the last hit
   if (millis() - lastAlarmTime >= ALARM_ON_TIME) {
     digitalWrite(ALARM_PIN, LOW);
   }
 
+  // 4. Periodic System Heartbeat
   if (millis() - lastHeartbeat >= 2000) {
     Serial.println("[SYSTEM] Monitoring stream... OK");
     lastHeartbeat = millis();
@@ -82,7 +68,8 @@ void loop() {
 void calibrate() {
   Serial.println("Establishing baselines...");
   for (int ch = 0; ch < NUM_CHANNELS; ch++) {
-    selectChannel(ch);
+    digitalWrite(S0, ch & 0x01);
+    digitalWrite(S1, (ch >> 1) & 0x01);
     delay(50);
 
     double sum = 0;
@@ -97,15 +84,16 @@ void calibrate() {
     Serial.print(" Baseline: "); Serial.print(baseline[ch], 3);
     Serial.print("V | Threshold: "); Serial.println(threshold[ch], 3);
   }
-  Serial.println("--- MONITORING ACTIVE ---");
+  Serial.println("--- MONITORING ACTIVE: CONTINUOUS SCAN MODE ---");
 }
 
 void logDetection(int sensorNum, float value) {
   digitalWrite(ALARM_PIN, HIGH);
-  lastAlarmTime = millis();
+  lastAlarmTime = millis(); // Refresh the alarm timer
 
+  // Log the notification with the system uptime
   Serial.print("[EVENT] ");
-  Serial.print(millis() / 1000.0, 2);
+  Serial.print(millis() / 1000.0, 2); // Timestamp in seconds
   Serial.print("s | METAL DETECTED | Sensor: ");
   Serial.print(sensorNum);
   Serial.print(" | Voltage: ");
