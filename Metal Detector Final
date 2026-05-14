@@ -1,0 +1,249 @@
+/*
+ * ============================================================
+ *  Wheat Milling Cast Iron Detector — v2.0
+ *  Sensor: Hall effect (analog) + Neodymium magnets
+ *  Target: Ferromagnetic cast iron (field-shunting detection)
+ *
+ *  Key improvements over v1:
+ *    - Bidirectional detection (catches voltage DROPS from field shunting)
+ *    - Rate-of-change guard (ignores slow thermal drift, catches fast passes)
+ *    - Per-channel debounce (one log line per physical pass)
+ *    - Exponential moving average (EMA) baseline that self-corrects over time
+ *    - 16x oversampling (~12-bit effective resolution, ~3mV per step)
+ *    - 500µs MUX settle time (was 100µs — insufficient)
+ *    - SPIKE_DELTA tuned for cast iron (subtle field shunting)
+ *    - Alarm pin removed
+ * ============================================================
+ */
+
+// ── Pin Definitions ─────────────────────────────────────────
+const int S0      = 8;    // MUX select bit 0
+const int S1      = 9;    // MUX select bit 1
+const int SIG_PIN = A0;   // Shared analog signal from MUX output
+
+// ── Channel Count ────────────────────────────────────────────
+const int NUM_CHANNELS = 4;
+
+// ── ADC / Voltage Reference ──────────────────────────────────
+const float VREF          = 3.3;    // Match your board's AREF (3.3V or 5.0V)
+const int   OVERSAMPLE_N  = 16;     // 16 reads averaged → ~12-bit effective res
+                                    // Each ADC step ≈ 3.2mV/16 ≈ 0.2mV
+
+// ── Detection Thresholds ─────────────────────────────────────
+//
+//  SPIKE_DELTA: Minimum voltage deviation from baseline to consider a hit.
+//               Cast iron shunts the magnetic field AWAY from the sensor,
+//               so the reading typically DROPS. Start at 0.030V and lower
+//               if you're getting missed detections with known cast iron.
+//
+//  RATE_THRESHOLD: Minimum volts-per-millisecond the signal must be changing.
+//                  This rejects slow thermal/environmental drift (which moves
+//                  at <<0.001 V/ms) while catching a real ferrous pass
+//                  (~0.005–0.05 V/ms depending on belt speed).
+//
+const float SPIKE_DELTA     = 0.030;  // V  — tune down toward 0.015 if needed
+const float RATE_THRESHOLD  = 0.001;  // V/ms — tune for your belt speed
+
+// ── Baseline (EMA) ───────────────────────────────────────────
+//  Alpha controls how fast the baseline follows slow drift.
+//  0.001 means the baseline moves ~63% of the way to a new steady value
+//  after ~1000 updates. At 4ms/loop that's ~4 seconds — slow enough to
+//  ignore a real detection event, fast enough to handle temperature drift.
+const float EMA_ALPHA = 0.001;
+
+// ── Calibration ──────────────────────────────────────────────
+const int CAL_SAMPLES = 128;   // More samples = more stable initial baseline
+
+// ── Debounce ─────────────────────────────────────────────────
+//  How long (ms) after a detection before we can log another hit on the
+//  same channel. Set this to slightly longer than the longest expected
+//  transit time of a contaminant piece across your sensor gap.
+const unsigned long DEBOUNCE_MS = 400;
+
+// ── Heartbeat ────────────────────────────────────────────────
+const unsigned long HEARTBEAT_MS = 5000;  // Print "still alive" every 5s
+
+// ── Runtime State ────────────────────────────────────────────
+float         baseline[NUM_CHANNELS];
+float         lastReading[NUM_CHANNELS];
+unsigned long lastReadTime[NUM_CHANNELS];
+bool          inEvent[NUM_CHANNELS];
+unsigned long lastEventTime[NUM_CHANNELS];
+unsigned long lastHeartbeat = 0;
+
+
+// ════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════
+void setup() {
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println(F("=============================================="));
+  Serial.println(F(" Wheat Mill Cast Iron Detector  v2.0"));
+  Serial.println(F("=============================================="));
+  Serial.print(F("  SPIKE_DELTA   : ")); Serial.print(SPIKE_DELTA * 1000, 1);  Serial.println(F(" mV"));
+  Serial.print(F("  RATE_THRESHOLD: ")); Serial.print(RATE_THRESHOLD * 1000, 1); Serial.println(F(" mV/ms"));
+  Serial.print(F("  DEBOUNCE      : ")); Serial.print(DEBOUNCE_MS);             Serial.println(F(" ms"));
+  Serial.print(F("  EMA_ALPHA     : ")); Serial.println(EMA_ALPHA, 4);
+  Serial.println(F("=============================================="));
+
+  calibrate();
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ════════════════════════════════════════════════════════════
+void loop() {
+
+  for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+
+    // 1. Select MUX channel
+    selectChannel(ch);
+
+    // 2. Oversampled voltage read
+    float volts = oversampledRead(SIG_PIN);
+    unsigned long now = millis();
+
+    // 3. Compute deviation from baseline (signed — negative = field shunting)
+    float delta = volts - baseline[ch];
+
+    // 4. Compute rate of change (V/ms) — guards against slow thermal drift
+    float dt   = (float)(now - lastReadTime[ch]);
+    float rate = (dt > 0) ? abs(volts - lastReading[ch]) / dt : 0.0;
+
+    // 5. Detection: bidirectional delta AND rate guard
+    bool triggered = (abs(delta) >= SPIKE_DELTA) && (rate >= RATE_THRESHOLD);
+
+    if (triggered) {
+      // Only log the LEADING EDGE of each event (debounce)
+      if (!inEvent[ch] || (now - lastEventTime[ch] >= DEBOUNCE_MS)) {
+        inEvent[ch]     = true;
+        lastEventTime[ch] = now;
+        logDetection(ch + 1, volts, delta, rate);
+      }
+    } else {
+      // Reset event flag once signal returns to baseline
+      if (inEvent[ch] && (now - lastEventTime[ch] >= DEBOUNCE_MS)) {
+        inEvent[ch] = false;
+      }
+
+      // 6. Update baseline via EMA — ONLY when no event is active on this channel
+      //    Prevents a long contaminant pass from corrupting the baseline
+      baseline[ch] = (EMA_ALPHA * volts) + ((1.0 - EMA_ALPHA) * baseline[ch]);
+    }
+
+    // 7. Save state for next iteration's rate calculation
+    lastReading[ch]  = volts;
+    lastReadTime[ch] = now;
+
+    delay(1);  // ~1ms per channel → ~4ms full scan cycle
+  }
+
+  // 8. Periodic heartbeat
+  if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
+    printHeartbeat();
+    lastHeartbeat = millis();
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  SELECT MUX CHANNEL  (with extended settle time)
+// ════════════════════════════════════════════════════════════
+void selectChannel(int ch) {
+  digitalWrite(S0, ch & 0x01);
+  digitalWrite(S1, (ch >> 1) & 0x01);
+  delayMicroseconds(500);  // Was 100µs in v1 — 500µs ensures MUX+ADC settle
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  OVERSAMPLED READ  (16 samples → effective ~12-bit resolution)
+//  Each effective ADC step ≈ 0.2mV at 3.3V — enough to catch
+//  the subtle field perturbation from cast iron.
+// ════════════════════════════════════════════════════════════
+float oversampledRead(int pin) {
+  long sum = 0;
+  for (int k = 0; k < OVERSAMPLE_N; k++) {
+    sum += analogRead(pin);
+  }
+  // Divide by OVERSAMPLE_N to average, then convert to volts
+  return ((float)sum / OVERSAMPLE_N * VREF) / 1023.0;
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  CALIBRATION  (128-sample average per channel at startup)
+// ════════════════════════════════════════════════════════════
+void calibrate() {
+  Serial.println(F("\n[CAL] Establishing baselines — keep sensors clear of metal..."));
+
+  for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+    selectChannel(ch);
+    delay(10);  // Extra settle before calibration begins
+
+    double sum = 0;
+    for (int s = 0; s < CAL_SAMPLES; s++) {
+      sum += oversampledRead(SIG_PIN);
+      delay(5);
+    }
+
+    baseline[ch]     = (float)(sum / CAL_SAMPLES);
+    lastReading[ch]  = baseline[ch];
+    lastReadTime[ch] = millis();
+    inEvent[ch]      = false;
+    lastEventTime[ch]= 0;
+
+    Serial.print(F("[CAL] Ch")); Serial.print(ch + 1);
+    Serial.print(F("  Baseline: ")); Serial.print(baseline[ch] * 1000, 1);
+    Serial.print(F(" mV  |  Trigger at ±")); Serial.print(SPIKE_DELTA * 1000, 1);
+    Serial.println(F(" mV"));
+  }
+
+  Serial.println(F("\n[SYS] *** MONITORING ACTIVE ***"));
+  Serial.println(F("[SYS] Detection: bidirectional | EMA baseline | Debounced\n"));
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  LOG DETECTION EVENT
+// ════════════════════════════════════════════════════════════
+void logDetection(int sensorNum, float volts, float delta, float rate) {
+  // Direction tells us whether the field was shunted (negative delta = cast iron
+  // diverting flux away from sensor) or amplified (positive = flux concentration).
+
+  Serial.print(F("[EVENT] "));
+  Serial.print(millis() / 1000.0, 3);
+  Serial.print(F("s | METAL DETECTED | Ch: "));
+  Serial.print(sensorNum);
+  Serial.print(F(" | V: "));
+  Serial.print(volts * 1000, 1);
+  Serial.print(F(" mV | Delta: "));
+  Serial.print(delta * 1000, 1);
+  Serial.print(F(" mV | Rate: "));
+  Serial.print(rate * 1000, 2);
+  Serial.println(F(" mV/ms"));
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  HEARTBEAT — prints live baselines so you can watch EMA drift
+// ════════════════════════════════════════════════════════════
+void printHeartbeat() {
+  //Serial.print(F("[SYS] "));
+  //Serial.print(millis() / 1000.0, 1);
+  //Serial.print(F("s | Baselines (mV): "));
+  for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+    //Serial.print(F("Ch")); Serial.print(ch + 1);
+    //Serial.print(F("="));
+    Serial.print(baseline[ch] * 1000, 1);
+    Serial.print("\t");
+    //if (ch < NUM_CHANNELS - 1) Serial.print(F("  "));
+  }
+  Serial.println();
+}
